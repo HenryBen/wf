@@ -1,852 +1,771 @@
 # YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
 """
-Train a YOLOv5 model on a custom dataset. Models and datasets download automatically from the latest YOLOv5 release.
+TensorFlow, Keras and TFLite versions of YOLOv5
+Authored by https://github.com/zldrobit in PR https://github.com/ultralytics/yolov5/pull/1127
 
-Usage - Single-GPU training:
-    $ python train.py --data coco128.yaml --weights yolov5s.pt --img 640  # from pretrained (recommended)
-    $ python train.py --data coco128.yaml --weights '' --cfg yolov5s.yaml --img 640  # from scratch
+Usage:
+    $ python models/tf.py --weights yolov5s.pt
 
-Usage - Multi-GPU DDP training:
-    $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train.py --data coco128.yaml --weights yolov5s.pt --img 640 --device 0,1,2,3
-
-Models:     https://github.com/ultralytics/yolov5/tree/master/models
-Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
-Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
+Export:
+    $ python export.py --weights yolov5s.pt --include saved_model pb tflite tfjs
 """
 
 import argparse
-import math
-import os
-import random
-import subprocess
 import sys
-import time
 from copy import deepcopy
-from datetime import datetime, timedelta
 from pathlib import Path
 
-try:
-    import comet_ml  # must be imported before torch (if installed)
-except ImportError:
-    comet_ml = None
-
-import numpy as np
-import torch
-import torch.distributed as dist
-import torch.nn as nn
-import yaml
-from torch.optim import lr_scheduler
-from tqdm import tqdm
-
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # YOLOv5 root directory
+ROOT = FILE.parents[1]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
-ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+# ROOT = ROOT.relative_to(Path.cwd())  # relative
 
-import val as validate  # for end-of-epoch mAP
-from models.experimental import attempt_load
-from models.yolo import Model
-from utils.autoanchor import check_anchors
-from utils.autobatch import check_train_batch_size
-from utils.callbacks import Callbacks
-from utils.dataloaders import create_dataloader
-from utils.downloads import attempt_download, is_url
-from utils.general import (
-    LOGGER,
-    TQDM_BAR_FORMAT,
-    check_amp,
-    check_dataset2,
-    check_file,
-    check_git_info,
-    check_git_status,
-    check_img_size,
-    check_requirements,
-    check_suffix,
-    check_yaml,
-    colorstr,
-    get_latest_run,
-    increment_path,
-    init_seeds,
-    intersect_dicts,
-    labels_to_class_weights,
-    labels_to_image_weights,
-    methods,
-    one_cycle,
-    print_args,
-    print_mutation,
-    strip_optimizer,
-    yaml_save,
+import numpy as np
+import tensorflow as tf
+import torch
+import torch.nn as nn
+from tensorflow import keras
+
+from models.common import (
+    C3,
+    SPP,
+    SPPF,
+    Bottleneck,
+    BottleneckCSP,
+    C3x,
+    Concat,
+    Conv,
+    CrossConv,
+    DWConv,
+    DWConvTranspose2d,
+    Focus,
+    autopad,
 )
-from utils.loggers import LOGGERS, Loggers
-from utils.loggers.comet.comet_utils import check_comet_resume
-from utils.loss import ComputeLoss
-from utils.metrics import fitness
-from utils.plots import plot_evolve
-from utils.torch_utils import (
-    EarlyStopping,
-    ModelEMA,
-    de_parallel,
-    select_device,
-    smart_DDP,
-    smart_optimizer,
-    smart_resume,
-    torch_distributed_zero_first,
-)
-
-LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
-RANK = int(os.getenv("RANK", -1))
-WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
-GIT_INFO = check_git_info()
+from models.experimental import MixConv2d, attempt_load
+from models.yolo import Detect, Segment
+from utils.activations import SiLU
+from utils.general import LOGGER, make_divisible, print_args
 
 
-def train(hyp, opt, device, callbacks):
-    """
-    Trains YOLOv5 model with given hyperparameters, options, and device, managing datasets, model architecture, loss
-    computation, and optimizer steps.
-
-    `hyp` argument is path/to/hyp.yaml or hyp dictionary.
-    """
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = (
-        Path(opt.save_dir),
-        opt.epochs,
-        opt.batch_size,
-        opt.weights,
-        opt.single_cls,
-        opt.evolve,
-        opt.data,
-        opt.cfg,
-        opt.resume,
-        opt.noval,
-        opt.nosave,
-        opt.workers,
-        opt.freeze,
-    )
-    callbacks.run("on_pretrain_routine_start")
-
-    # Directories
-    w = save_dir / "weights"  # weights dir
-    (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
-    last, best = w / "last.pt", w / "best.pt"
-
-    # Hyperparameters
-    if isinstance(hyp, str):
-        with open(hyp, errors="ignore") as f:
-            hyp = yaml.safe_load(f)  # load hyps dict
-    LOGGER.info(colorstr("hyperparameters: ") + ", ".join(f"{k}={v}" for k, v in hyp.items()))
-    opt.hyp = hyp.copy()  # for saving hyps to checkpoints
-
-    # Save run settings
-    if not evolve:
-        yaml_save(save_dir / "hyp.yaml", hyp)
-        yaml_save(save_dir / "opt.yaml", vars(opt))
-
-    # Loggers
-    data_dict = None
-    if RANK in {-1, 0}:
-        include_loggers = list(LOGGERS)
-        if getattr(opt, "ndjson_console", False):
-            include_loggers.append("ndjson_console")
-        if getattr(opt, "ndjson_file", False):
-            include_loggers.append("ndjson_file")
-
-        loggers = Loggers(
-            save_dir=save_dir,
-            weights=weights,
-            opt=opt,
-            hyp=hyp,
-            logger=LOGGER,
-            include=tuple(include_loggers),
+class TFBN(keras.layers.Layer):
+    # TensorFlow BatchNormalization wrapper
+    def __init__(self, w=None):
+        """Initializes a TensorFlow BatchNormalization layer with optional pretrained weights."""
+        super().__init__()
+        self.bn = keras.layers.BatchNormalization(
+            beta_initializer=keras.initializers.Constant(w.bias.numpy()),
+            gamma_initializer=keras.initializers.Constant(w.weight.numpy()),
+            moving_mean_initializer=keras.initializers.Constant(w.running_mean.numpy()),
+            moving_variance_initializer=keras.initializers.Constant(w.running_var.numpy()),
+            epsilon=w.eps,
         )
 
-        # Register actions
-        for k in methods(loggers):
-            callbacks.register_action(k, callback=getattr(loggers, k))
+    def call(self, inputs):
+        """Applies batch normalization to the inputs."""
+        return self.bn(inputs)
 
-        # Process custom dataset artifact link
-        data_dict = loggers.remote_dataset
-        if resume:  # If resuming runs from remote artifact
-            weights, epochs, hyp, batch_size = opt.weights, opt.epochs, opt.hyp, opt.batch_size
 
-    # Config
-    plots = not evolve and not opt.noplots  # create plots
-    cuda = device.type != "cpu"
-    init_seeds(opt.seed + 1 + RANK, deterministic=True)
-    with torch_distributed_zero_first(LOCAL_RANK):
-        data_dict = data_dict or check_dataset2(data, opt.label_class, opt.label_class_count)  # check if None
+class TFPad(keras.layers.Layer):
+    # Pad inputs in spatial dimensions 1 and 2
+    def __init__(self, pad):
+        """
+        Initializes a padding layer for spatial dimensions 1 and 2 with specified padding, supporting both int and tuple
+        inputs.
 
-    print("data_dict=", data_dict)
-    train_path, val_path = data_dict["train"], data_dict["val"]
-    nc = 1 if single_cls else int(data_dict["nc"])  # number of classes
-    names = {0: "item"} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]  # class names
-    is_coco = isinstance(val_path, str) and val_path.endswith("coco/val2017.txt")  # COCO dataset
+        Inputs are
+        """
+        super().__init__()
+        if isinstance(pad, int):
+            self.pad = tf.constant([[0, 0], [pad, pad], [pad, pad], [0, 0]])
+        else:  # tuple/list
+            self.pad = tf.constant([[0, 0], [pad[0], pad[0]], [pad[1], pad[1]], [0, 0]])
 
-    # Model
-    check_suffix(weights, ".pt")  # check weights
-    pretrained = weights.endswith(".pt")
-    if pretrained:
-        with torch_distributed_zero_first(LOCAL_RANK):
-            weights = attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
-        exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
-        csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
-        model.load_state_dict(csd, strict=False)  # load
-        LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
-    else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
-    amp = check_amp(model)  # check AMP
+    def call(self, inputs):
+        """Pads input tensor with zeros using specified padding, suitable for int and tuple pad dimensions."""
+        return tf.pad(inputs, self.pad, mode="constant", constant_values=0)
 
-    # Freeze
-    freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-        if any(x in k for x in freeze):
-            LOGGER.info(f"freezing {k}")
-            v.requires_grad = False
 
-    # Image size
-    gs = max(int(model.stride.max()), 32)  # grid size (max stride)
-    imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+class TFConv(keras.layers.Layer):
+    # Standard convolution
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, w=None):
+        """
+        Initializes a standard convolution layer with optional batch normalization and activation; supports only
+        group=1.
 
-    # Batch size
-    if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
-        batch_size = check_train_batch_size(model, imgsz, amp)
-        loggers.on_params_update({"batch_size": batch_size})
-
-    # Optimizer
-    nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
-    hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
-
-    # Scheduler
-    if opt.cos_lr:
-        lf = one_cycle(1, hyp["lrf"], epochs)  # cosine 1->hyp['lrf']
-    else:
-        lf = lambda x: (1 - x / epochs) * (1.0 - hyp["lrf"]) + hyp["lrf"]  # linear
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
-
-    # EMA
-    ema = ModelEMA(model) if RANK in {-1, 0} else None
-
-    # Resume
-    best_fitness, start_epoch = 0.0, 0
-    if pretrained:
-        if resume:
-            best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
-        del ckpt, csd
-
-    # DP mode
-    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
-        LOGGER.warning(
-            "WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n"
-            "See Multi-GPU Tutorial at https://docs.ultralytics.com/yolov5/tutorials/multi_gpu_training to get started."
+        Inputs are ch_in, ch_out, weights, kernel, stride, padding, groups.
+        """
+        super().__init__()
+        assert g == 1, "TF v2.2 Conv2D does not support 'groups' argument"
+        # TensorFlow convolution padding is inconsistent with PyTorch (e.g. k=3 s=2 'SAME' padding)
+        # see https://stackoverflow.com/questions/52975843/comparing-conv2d-with-padding-between-tensorflow-and-pytorch
+        conv = keras.layers.Conv2D(
+            filters=c2,
+            kernel_size=k,
+            strides=s,
+            padding="SAME" if s == 1 else "VALID",
+            use_bias=not hasattr(w, "bn"),
+            kernel_initializer=keras.initializers.Constant(w.conv.weight.permute(2, 3, 1, 0).numpy()),
+            bias_initializer="zeros" if hasattr(w, "bn") else keras.initializers.Constant(w.conv.bias.numpy()),
         )
-        model = torch.nn.DataParallel(model)
+        self.conv = conv if s == 1 else keras.Sequential([TFPad(autopad(k, p)), conv])
+        self.bn = TFBN(w.bn) if hasattr(w, "bn") else tf.identity
+        self.act = activations(w.act) if act else tf.identity
 
-    # SyncBatchNorm
-    if opt.sync_bn and cuda and RANK != -1:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-        LOGGER.info("Using SyncBatchNorm()")
-
-    # Trainloader
-    train_loader, dataset = create_dataloader(
-        train_path,
-        imgsz,
-        batch_size // WORLD_SIZE,
-        gs,
-        single_cls,
-        hyp=hyp,
-        augment=True,
-        cache=None if opt.cache == "val" else opt.cache,
-        rect=opt.rect,
-        rank=LOCAL_RANK,
-        workers=workers,
-        image_weights=opt.image_weights,
-        quad=opt.quad,
-        prefix=colorstr("train: "),
-        shuffle=True,
-        seed=opt.seed,
-    )
-    labels = np.concatenate(dataset.labels, 0)
-    mlc = int(labels[:, 0].max())  # max label class
-    assert mlc < nc, f"Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}"
-
-    # Process 0
-    if RANK in {-1, 0}:
-        val_loader = create_dataloader(
-            val_path,
-            imgsz,
-            batch_size // WORLD_SIZE * 2,
-            gs,
-            single_cls,
-            hyp=hyp,
-            cache=None if noval else opt.cache,
-            rect=True,
-            rank=-1,
-            workers=workers * 2,
-            pad=0.5,
-            prefix=colorstr("val: "),
-        )[0]
-
-        if not resume:
-            if not opt.noautoanchor:
-                check_anchors(dataset, model=model, thr=hyp["anchor_t"], imgsz=imgsz)  # run AutoAnchor
-            model.half().float()  # pre-reduce anchor precision
-
-        callbacks.run("on_pretrain_routine_end", labels, names)
-
-    # DDP mode
-    if cuda and RANK != -1:
-        model = smart_DDP(model)
-
-    # Model attributes
-    nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
-    hyp["box"] *= 3 / nl  # scale to layers
-    hyp["cls"] *= nc / 80 * 3 / nl  # scale to classes and layers
-    hyp["obj"] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
-    hyp["label_smoothing"] = opt.label_smoothing
-    model.nc = nc  # attach number of classes to model
-    model.hyp = hyp  # attach hyperparameters to model
-    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
-    model.names = names
-
-    # Start training
-    t0 = time.time()
-    nb = len(train_loader)  # number of batches
-    nw = max(round(hyp["warmup_epochs"] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
-    # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
-    last_opt_step = -1
-    maps = np.zeros(nc)  # mAP per class
-    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
-    scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
-    callbacks.run("on_train_start")
-    LOGGER.info(
-        f'Image sizes {imgsz} train, {imgsz} val\n'
-        f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
-        f"Logging results to {colorstr('bold', save_dir)}\n"
-        f'Starting training for {epochs} epochs...'
-    )
-    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
-        callbacks.run("on_train_epoch_start")
-        model.train()
-
-        # Update image weights (optional, single-GPU only)
-        if opt.image_weights:
-            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
-            iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
-            dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
-
-        # Update mosaic border (optional)
-        # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
-        # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
-
-        mloss = torch.zeros(3, device=device)  # mean losses
-        if RANK != -1:
-            train_loader.sampler.set_epoch(epoch)
-        pbar = enumerate(train_loader)
-        LOGGER.info(("\n" + "%11s" * 7) % ("Epoch", "GPU_mem", "box_loss", "obj_loss", "cls_loss", "Instances", "Size"))
-        if RANK in {-1, 0}:
-            pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
-        optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-            callbacks.run("on_train_batch_start")
-            ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
-            # Warmup
-            if ni <= nw:
-                xi = [0, nw]  # x interp
-                # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
-                for j, x in enumerate(optimizer.param_groups):
-                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x["lr"] = np.interp(ni, xi, [hyp["warmup_bias_lr"] if j == 0 else 0.0, x["initial_lr"] * lf(epoch)])
-                    if "momentum" in x:
-                        x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
-
-            # Multi-scale
-            if opt.multi_scale:
-                sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs  # size
-                sf = sz / max(imgs.shape[2:])  # scale factor
-                if sf != 1:
-                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
-                    imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
-
-            # Forward
-            with torch.cuda.amp.autocast(amp):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.0
-
-            # Backward
-            scaler.scale(loss).backward()
-
-            # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
-            if ni - last_opt_step >= accumulate:
-                scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
-                last_opt_step = ni
-
-            # Log
-            if RANK in {-1, 0}:
-                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-                mem = f"{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
-                pbar.set_description(
-                    ("%11s" * 2 + "%11.4g" * 5)
-                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
-                )
-                callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
-                if callbacks.stop_training:
-                    return
-            # end batch ------------------------------------------------------------------------------------------------
-
-        LOGGER.info(f'box_loss: {mloss[0]}, obj_loss: {mloss[1]}, cls_loss: {mloss[2]}')
-
-        # Scheduler
-        lr = [x["lr"] for x in optimizer.param_groups]  # for loggers
-        scheduler.step()
-
-        if RANK in {-1, 0}:
-            # mAP
-            callbacks.run("on_train_epoch_end", epoch=epoch)
-            ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
-            final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
-            if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = validate.run(
-                    data_dict,
-                    batch_size=batch_size // WORLD_SIZE * 2,
-                    imgsz=imgsz,
-                    half=amp,
-                    model=ema.ema,
-                    single_cls=single_cls,
-                    dataloader=val_loader,
-                    save_dir=save_dir,
-                    plots=False,
-                    callbacks=callbacks,
-                    compute_loss=compute_loss,
-                )
-
-            # Update best mAP
-            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            stop = stopper(epoch=epoch, fitness=fi)  # early stop check
-            if fi > best_fitness:
-                best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
-            callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
-
-            # Save model
-            if (not nosave) or (final_epoch and not evolve):  # if save
-                ckpt = {
-                    "epoch": epoch,
-                    "best_fitness": best_fitness,
-                    "model": deepcopy(de_parallel(model)).half(),
-                    "ema": deepcopy(ema.ema).half(),
-                    "updates": ema.updates,
-                    "optimizer": optimizer.state_dict(),
-                    "opt": vars(opt),
-                    "git": GIT_INFO,  # {remote, branch, commit} if a git repo
-                    "date": datetime.now().isoformat(),
-                }
-
-                # Save last, best and delete
-                torch.save(ckpt, last)
-                if best_fitness == fi:
-                    torch.save(ckpt, best)
-                if opt.save_period > 0 and epoch % opt.save_period == 0:
-                    torch.save(ckpt, w / f"epoch{epoch}.pt")
-                del ckpt
-                callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
-
-        # EarlyStopping
-        if RANK != -1:  # if DDP training
-            broadcast_list = [stop if RANK == 0 else None]
-            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-            if RANK != 0:
-                stop = broadcast_list[0]
-        if stop:
-            break  # must break all DDP ranks
-
-        # end epoch ----------------------------------------------------------------------------------------------------
-    # end training -----------------------------------------------------------------------------------------------------
-    if RANK in {-1, 0}:
-        LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
-        for f in last, best:
-            if f.exists():
-                strip_optimizer(f)  # strip optimizers
-                if f is best:
-                    LOGGER.info(f"\nValidating {f}...")
-                    results, _, _ = validate.run(
-                        data_dict,
-                        batch_size=batch_size // WORLD_SIZE * 2,
-                        imgsz=imgsz,
-                        model=attempt_load(f, device).half(),
-                        iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
-                        single_cls=single_cls,
-                        dataloader=val_loader,
-                        save_dir=save_dir,
-                        save_json=is_coco,
-                        verbose=True,
-                        plots=plots,
-                        callbacks=callbacks,
-                        compute_loss=compute_loss,
-                    )  # val best model with plots
-                    if is_coco:
-                        callbacks.run("on_fit_epoch_end", list(mloss) + list(results) + lr, epoch, best_fitness, fi)
-
-        callbacks.run("on_train_end", last, best, epoch, results)
-
-    torch.cuda.empty_cache()
-    return results
+    def call(self, inputs):
+        """Applies convolution, batch normalization, and activation function to input tensors."""
+        return self.act(self.bn(self.conv(inputs)))
 
 
-def parse_opt(known=False):
-    """Parses command-line arguments for YOLOv5 training, validation, and testing."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
-    parser.add_argument("--label-class", type=str, default="", help="label class")
-    parser.add_argument("--label-class-count", type=int, default=1, help="label class count")
-    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
-    parser.add_argument("--epochs", type=int, default=10, help="total training epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="total batch size for all GPUs, -1 for autobatch")
-    parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
-    parser.add_argument("--rect", action="store_true", help="rectangular training")
-    parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")
-    parser.add_argument("--nosave", action="store_true", help="only save final checkpoint")
-    parser.add_argument("--noval", action="store_true", help="only validate final epoch")
-    parser.add_argument("--noautoanchor", action="store_true", help="disable AutoAnchor")
-    parser.add_argument("--noplots", action="store_true", help="save no plot files")
-    parser.add_argument("--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations")
-    parser.add_argument(
-        "--evolve_population", type=str, default=ROOT / "data/hyps", help="location for loading population"
-    )
-    parser.add_argument("--resume_evolve", type=str, default=None, help="resume evolve from last generation")
-    parser.add_argument("--bucket", type=str, default="", help="gsutil bucket")
-    parser.add_argument("--cache", type=str, nargs="?", const="ram", help="image --cache ram/disk")
-    parser.add_argument("--image-weights", action="store_true", help="use weighted image selection for training")
-    parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
-    parser.add_argument("--multi-scale", action="store_true", help="vary img-size +/- 50%%")
-    parser.add_argument("--single-cls", action="store_true", help="train multi-class data as single-class")
-    parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam", "AdamW"], default="SGD", help="optimizer")
-    parser.add_argument("--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode")
-    parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
-    parser.add_argument("--work-dir", default=ROOT / "runs/train", help="save to project/name")
-    parser.add_argument("--name", default="exp", help="save to project/name")
-    parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
-    parser.add_argument("--quad", action="store_true", help="quad dataloader")
-    parser.add_argument("--cos-lr", action="store_true", help="cosine LR scheduler")
-    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon")
-    parser.add_argument("--patience", type=int, default=100, help="EarlyStopping patience (epochs without improvement)")
-    parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
-    parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
-    parser.add_argument("--seed", type=int, default=0, help="Global training seed")
-    parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
+class TFDWConv(keras.layers.Layer):
+    # Depthwise convolution
+    def __init__(self, c1, c2, k=1, s=1, p=None, act=True, w=None):
+        """
+        Initializes a depthwise convolution layer with optional batch normalization and activation for TensorFlow
+        models.
 
-    # Logger arguments
-    parser.add_argument("--entity", default=None, help="Entity")
-    parser.add_argument("--upload_dataset", nargs="?", const=True, default=False, help='Upload data, "val" option')
-    parser.add_argument("--bbox_interval", type=int, default=-1, help="Set bounding-box image logging interval")
-    parser.add_argument("--artifact_alias", type=str, default="latest", help="Version of dataset artifact to use")
-
-    # NDJSON logging
-    parser.add_argument("--ndjson-console", action="store_true", help="Log ndjson to console")
-    parser.add_argument("--ndjson-file", action="store_true", help="Log ndjson to file")
-
-    return parser.parse_known_args()[0] if known else parser.parse_args()
-
-
-def main(opt, callbacks=Callbacks()):
-    """Runs training or hyperparameter evolution with specified options and optional callbacks."""
-    if RANK in {-1, 0}:
-        print_args(vars(opt))
-        check_git_status()
-        check_requirements(ROOT / "requirements.txt")
-
-    # Resume (from specified or most recent last.pt)
-    if opt.resume and not check_comet_resume(opt) and not opt.evolve:
-        last = Path(check_file(opt.resume) if isinstance(opt.resume, str) else get_latest_run())
-        opt_yaml = last.parent.parent / "opt.yaml"  # train options yaml
-        opt_data = opt.data  # original dataset
-        if opt_yaml.is_file():
-            with open(opt_yaml, errors="ignore") as f:
-                d = yaml.safe_load(f)
-        else:
-            d = torch.load(last, map_location="cpu")["opt"]
-        opt = argparse.Namespace(**d)  # replace
-        opt.cfg, opt.weights, opt.resume = "", str(last), True  # reinstate
-        if is_url(opt_data):
-            opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
-    else:
-        opt.data, opt.cfg, opt.hyp, opt.weights, opt.work_dir = (
-            str(opt.data),
-            check_yaml(opt.cfg),
-            check_yaml(opt.hyp),
-            str(opt.weights),
-            str(opt.work_dir),
-        )  # checks
-        assert len(opt.cfg) or len(opt.weights), "either --cfg or --weights must be specified"
-        if opt.evolve:
-            if opt.work_dir == str(ROOT / "runs/train"):  # if default project name, rename to runs/evolve
-                opt.work_dir = str(ROOT / "runs/evolve")
-            opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
-        if opt.name == "cfg":
-            opt.name = Path(opt.cfg).stem  # use model.yaml as name
-        opt.save_dir = str(increment_path(Path(opt.work_dir) / opt.name, exist_ok=opt.exist_ok))
-
-    # DDP mode
-    device = select_device(opt.device, batch_size=opt.batch_size)
-    if LOCAL_RANK != -1:
-        msg = "is not compatible with YOLOv5 Multi-GPU DDP training"
-        assert not opt.image_weights, f"--image-weights {msg}"
-        assert not opt.evolve, f"--evolve {msg}"
-        assert opt.batch_size != -1, f"AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size"
-        assert opt.batch_size % WORLD_SIZE == 0, f"--batch-size {opt.batch_size} must be multiple of WORLD_SIZE"
-        assert torch.cuda.device_count() > LOCAL_RANK, "insufficient CUDA devices for DDP command"
-        torch.cuda.set_device(LOCAL_RANK)
-        device = torch.device("cuda", LOCAL_RANK)
-        dist.init_process_group(
-            backend="nccl" if dist.is_nccl_available() else "gloo", timeout=timedelta(seconds=10800)
+        Input are ch_in, ch_out, weights, kernel, stride, padding, groups.
+        """
+        super().__init__()
+        assert c2 % c1 == 0, f"TFDWConv() output={c2} must be a multiple of input={c1} channels"
+        conv = keras.layers.DepthwiseConv2D(
+            kernel_size=k,
+            depth_multiplier=c2 // c1,
+            strides=s,
+            padding="SAME" if s == 1 else "VALID",
+            use_bias=not hasattr(w, "bn"),
+            depthwise_initializer=keras.initializers.Constant(w.conv.weight.permute(2, 3, 1, 0).numpy()),
+            bias_initializer="zeros" if hasattr(w, "bn") else keras.initializers.Constant(w.conv.bias.numpy()),
         )
+        self.conv = conv if s == 1 else keras.Sequential([TFPad(autopad(k, p)), conv])
+        self.bn = TFBN(w.bn) if hasattr(w, "bn") else tf.identity
+        self.act = activations(w.act) if act else tf.identity
 
-    # Train
-    if not opt.evolve:
-        train(opt.hyp, opt, device, callbacks)
+    def call(self, inputs):
+        """Applies convolution, batch normalization, and activation function to input tensors."""
+        return self.act(self.bn(self.conv(inputs)))
 
-    # Evolve hyperparameters (optional)
-    else:
-        # Hyperparameter evolution metadata (including this hyperparameter True-False, lower_limit, upper_limit)
-        meta = {
-            "lr0": (False, 1e-5, 1e-1),  # initial learning rate (SGD=1E-2, Adam=1E-3)
-            "lrf": (False, 0.01, 1.0),  # final OneCycleLR learning rate (lr0 * lrf)
-            "momentum": (False, 0.6, 0.98),  # SGD momentum/Adam beta1
-            "weight_decay": (False, 0.0, 0.001),  # optimizer weight decay
-            "warmup_epochs": (False, 0.0, 5.0),  # warmup epochs (fractions ok)
-            "warmup_momentum": (False, 0.0, 0.95),  # warmup initial momentum
-            "warmup_bias_lr": (False, 0.0, 0.2),  # warmup initial bias lr
-            "box": (False, 0.02, 0.2),  # box loss gain
-            "cls": (False, 0.2, 4.0),  # cls loss gain
-            "cls_pw": (False, 0.5, 2.0),  # cls BCELoss positive_weight
-            "obj": (False, 0.2, 4.0),  # obj loss gain (scale with pixels)
-            "obj_pw": (False, 0.5, 2.0),  # obj BCELoss positive_weight
-            "iou_t": (False, 0.1, 0.7),  # IoU training threshold
-            "anchor_t": (False, 2.0, 8.0),  # anchor-multiple threshold
-            "anchors": (False, 2.0, 10.0),  # anchors per output grid (0 to ignore)
-            "fl_gamma": (False, 0.0, 2.0),  # focal loss gamma (efficientDet default gamma=1.5)
-            "hsv_h": (True, 0.0, 0.1),  # image HSV-Hue augmentation (fraction)
-            "hsv_s": (True, 0.0, 0.9),  # image HSV-Saturation augmentation (fraction)
-            "hsv_v": (True, 0.0, 0.9),  # image HSV-Value augmentation (fraction)
-            "degrees": (True, 0.0, 45.0),  # image rotation (+/- deg)
-            "translate": (True, 0.0, 0.9),  # image translation (+/- fraction)
-            "scale": (True, 0.0, 0.9),  # image scale (+/- gain)
-            "shear": (True, 0.0, 10.0),  # image shear (+/- deg)
-            "perspective": (True, 0.0, 0.001),  # image perspective (+/- fraction), range 0-0.001
-            "flipud": (True, 0.0, 1.0),  # image flip up-down (probability)
-            "fliplr": (True, 0.0, 1.0),  # image flip left-right (probability)
-            "mosaic": (True, 0.0, 1.0),  # image mixup (probability)
-            "mixup": (True, 0.0, 1.0),  # image mixup (probability)
-            "copy_paste": (True, 0.0, 1.0),
-        }  # segment copy-paste (probability)
 
-        # GA configs
-        pop_size = 50
-        mutation_rate_min = 0.01
-        mutation_rate_max = 0.5
-        crossover_rate_min = 0.5
-        crossover_rate_max = 1
-        min_elite_size = 2
-        max_elite_size = 5
-        tournament_size_min = 2
-        tournament_size_max = 10
+class TFDWConvTranspose2d(keras.layers.Layer):
+    # Depthwise ConvTranspose2d
+    def __init__(self, c1, c2, k=1, s=1, p1=0, p2=0, w=None):
+        """
+        Initializes depthwise ConvTranspose2D layer with specific channel, kernel, stride, and padding settings.
 
-        with open(opt.hyp, errors="ignore") as f:
-            hyp = yaml.safe_load(f)  # load hyps dict
-            if "anchors" not in hyp:  # anchors commented in hyp.yaml
-                hyp["anchors"] = 3
-        if opt.noautoanchor:
-            del hyp["anchors"], meta["anchors"]
-        opt.noval, opt.nosave, save_dir = True, True, Path(opt.save_dir)  # only val/save final epoch
-        # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
-        evolve_yaml, evolve_csv = save_dir / "hyp_evolve.yaml", save_dir / "evolve.csv"
-        if opt.bucket:
-            # download evolve.csv if exists
-            subprocess.run(
-                [
-                    "gsutil",
-                    "cp",
-                    f"gs://{opt.bucket}/evolve.csv",
-                    str(evolve_csv),
-                ]
+        Inputs are ch_in, ch_out, weights, kernel, stride, padding, groups.
+        """
+        super().__init__()
+        assert c1 == c2, f"TFDWConv() output={c2} must be equal to input={c1} channels"
+        assert k == 4 and p1 == 1, "TFDWConv() only valid for k=4 and p1=1"
+        weight, bias = w.weight.permute(2, 3, 1, 0).numpy(), w.bias.numpy()
+        self.c1 = c1
+        self.conv = [
+            keras.layers.Conv2DTranspose(
+                filters=1,
+                kernel_size=k,
+                strides=s,
+                padding="VALID",
+                output_padding=p2,
+                use_bias=True,
+                kernel_initializer=keras.initializers.Constant(weight[..., i : i + 1]),
+                bias_initializer=keras.initializers.Constant(bias[i]),
             )
+            for i in range(c1)
+        ]
 
-        # Delete the items in meta dictionary whose first value is False
-        del_ = [item for item, value_ in meta.items() if value_[0] is False]
-        hyp_GA = hyp.copy()  # Make a copy of hyp dictionary
-        for item in del_:
-            del meta[item]  # Remove the item from meta dictionary
-            del hyp_GA[item]  # Remove the item from hyp_GA dictionary
+    def call(self, inputs):
+        """Processes input through parallel convolutions and concatenates results, trimming border pixels."""
+        return tf.concat([m(x) for m, x in zip(self.conv, tf.split(inputs, self.c1, 3))], 3)[:, 1:-1, 1:-1]
 
-        # Set lower_limit and upper_limit arrays to hold the search space boundaries
-        lower_limit = np.array([meta[k][1] for k in hyp_GA.keys()])
-        upper_limit = np.array([meta[k][2] for k in hyp_GA.keys()])
 
-        # Create gene_ranges list to hold the range of values for each gene in the population
-        gene_ranges = [(lower_limit[i], upper_limit[i]) for i in range(len(upper_limit))]
+class TFFocus(keras.layers.Layer):
+    # Focus wh information into c-space
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, w=None):
+        """
+        Initializes TFFocus layer to focus width and height information into channel space with custom convolution
+        parameters.
 
-        # Initialize the population with initial_values or random values
-        initial_values = []
+        Inputs are ch_in, ch_out, kernel, stride, padding, groups.
+        """
+        super().__init__()
+        self.conv = TFConv(c1 * 4, c2, k, s, p, g, act, w.conv)
 
-        # If resuming evolution from a previous checkpoint
-        if opt.resume_evolve is not None:
-            assert os.path.isfile(ROOT / opt.resume_evolve), "evolve population path is wrong!"
-            with open(ROOT / opt.resume_evolve, errors="ignore") as f:
-                evolve_population = yaml.safe_load(f)
-                for value in evolve_population.values():
-                    value = np.array([value[k] for k in hyp_GA.keys()])
-                    initial_values.append(list(value))
+    def call(self, inputs):
+        """
+        Performs pixel shuffling and convolution on input tensor, downsampling by 2 and expanding channels by 4.
 
-        # If not resuming from a previous checkpoint, generate initial values from .yaml files in opt.evolve_population
-        else:
-            yaml_files = [f for f in os.listdir(opt.evolve_population) if f.endswith(".yaml")]
-            for file_name in yaml_files:
-                with open(os.path.join(opt.evolve_population, file_name)) as yaml_file:
-                    value = yaml.safe_load(yaml_file)
-                    value = np.array([value[k] for k in hyp_GA.keys()])
-                    initial_values.append(list(value))
+        Example x(b,w,h,c) -> y(b,w/2,h/2,4c).
+        """
+        inputs = [inputs[:, ::2, ::2, :], inputs[:, 1::2, ::2, :], inputs[:, ::2, 1::2, :], inputs[:, 1::2, 1::2, :]]
+        return self.conv(tf.concat(inputs, 3))
 
-        # Generate random values within the search space for the rest of the population
-        if initial_values is None:
-            population = [generate_individual(gene_ranges, len(hyp_GA)) for _ in range(pop_size)]
-        elif pop_size > 1:
-            population = [generate_individual(gene_ranges, len(hyp_GA)) for _ in range(pop_size - len(initial_values))]
-            for initial_value in initial_values:
-                population = [initial_value] + population
 
-        # Run the genetic algorithm for a fixed number of generations
-        list_keys = list(hyp_GA.keys())
-        for generation in range(opt.evolve):
-            if generation >= 1:
-                save_dict = {}
-                for i in range(len(population)):
-                    little_dict = {list_keys[j]: float(population[i][j]) for j in range(len(population[i]))}
-                    save_dict[f"gen{str(generation)}number{str(i)}"] = little_dict
+class TFBottleneck(keras.layers.Layer):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, w=None):
+        """
+        Initializes a standard bottleneck layer for TensorFlow models, expanding and contracting channels with optional
+        shortcut.
 
-                with open(save_dir / "evolve_population.yaml", "w") as outfile:
-                    yaml.dump(save_dict, outfile, default_flow_style=False)
+        Arguments are ch_in, ch_out, shortcut, groups, expansion.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = TFConv(c1, c_, 1, 1, w=w.cv1)
+        self.cv2 = TFConv(c_, c2, 3, 1, g=g, w=w.cv2)
+        self.add = shortcut and c1 == c2
 
-            # Adaptive elite size
-            elite_size = min_elite_size + int((max_elite_size - min_elite_size) * (generation / opt.evolve))
-            # Evaluate the fitness of each individual in the population
-            fitness_scores = []
-            for individual in population:
-                for key, value in zip(hyp_GA.keys(), individual):
-                    hyp_GA[key] = value
-                hyp.update(hyp_GA)
-                results = train(hyp.copy(), opt, device, callbacks)
-                callbacks = Callbacks()
-                # Write mutation results
-                keys = (
-                    "metrics/precision",
-                    "metrics/recall",
-                    "metrics/mAP_0.5",
-                    "metrics/mAP_0.5:0.95",
-                    "val/box_loss",
-                    "val/obj_loss",
-                    "val/cls_loss",
-                )
-                print_mutation(keys, results, hyp.copy(), save_dir, opt.bucket)
-                fitness_scores.append(results[2])
+    def call(self, inputs):
+        """Performs forward pass; if shortcut is True & input/output channels match, adds input to the convolution
+        result.
+        """
+        return inputs + self.cv2(self.cv1(inputs)) if self.add else self.cv2(self.cv1(inputs))
 
-            # Select the fittest individuals for reproduction using adaptive tournament selection
-            selected_indices = []
-            for _ in range(pop_size - elite_size):
-                # Adaptive tournament size
-                tournament_size = max(
-                    max(2, tournament_size_min),
-                    int(min(tournament_size_max, pop_size) - (generation / (opt.evolve / 10))),
-                )
-                # Perform tournament selection to choose the best individual
-                tournament_indices = random.sample(range(pop_size), tournament_size)
-                tournament_fitness = [fitness_scores[j] for j in tournament_indices]
-                winner_index = tournament_indices[tournament_fitness.index(max(tournament_fitness))]
-                selected_indices.append(winner_index)
 
-            # Add the elite individuals to the selected indices
-            elite_indices = [i for i in range(pop_size) if fitness_scores[i] in sorted(fitness_scores)[-elite_size:]]
-            selected_indices.extend(elite_indices)
-            # Create the next generation through crossover and mutation
-            next_generation = []
-            for _ in range(pop_size):
-                parent1_index = selected_indices[random.randint(0, pop_size - 1)]
-                parent2_index = selected_indices[random.randint(0, pop_size - 1)]
-                # Adaptive crossover rate
-                crossover_rate = max(
-                    crossover_rate_min, min(crossover_rate_max, crossover_rate_max - (generation / opt.evolve))
-                )
-                if random.uniform(0, 1) < crossover_rate:
-                    crossover_point = random.randint(1, len(hyp_GA) - 1)
-                    child = population[parent1_index][:crossover_point] + population[parent2_index][crossover_point:]
-                else:
-                    child = population[parent1_index]
-                # Adaptive mutation rate
-                mutation_rate = max(
-                    mutation_rate_min, min(mutation_rate_max, mutation_rate_max - (generation / opt.evolve))
-                )
-                for j in range(len(hyp_GA)):
-                    if random.uniform(0, 1) < mutation_rate:
-                        child[j] += random.uniform(-0.1, 0.1)
-                        child[j] = min(max(child[j], gene_ranges[j][0]), gene_ranges[j][1])
-                next_generation.append(child)
-            # Replace the old population with the new generation
-            population = next_generation
-        # Print the best solution found
-        best_index = fitness_scores.index(max(fitness_scores))
-        best_individual = population[best_index]
-        print("Best solution found:", best_individual)
-        # Plot results
-        plot_evolve(evolve_csv)
-        LOGGER.info(
-            f'Hyperparameter evolution finished {opt.evolve} generations\n'
-            f"Results saved to {colorstr('bold', save_dir)}\n"
-            f'Usage example: $ python train.py --hyp {evolve_yaml}'
+class TFCrossConv(keras.layers.Layer):
+    # Cross Convolution
+    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False, w=None):
+        """Initializes cross convolution layer with optional expansion, grouping, and shortcut addition capabilities."""
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = TFConv(c1, c_, (1, k), (1, s), w=w.cv1)
+        self.cv2 = TFConv(c_, c2, (k, 1), (s, 1), g=g, w=w.cv2)
+        self.add = shortcut and c1 == c2
+
+    def call(self, inputs):
+        """Passes input through two convolutions optionally adding the input if channel dimensions match."""
+        return inputs + self.cv2(self.cv1(inputs)) if self.add else self.cv2(self.cv1(inputs))
+
+
+class TFConv2d(keras.layers.Layer):
+    # Substitution for PyTorch nn.Conv2D
+    def __init__(self, c1, c2, k, s=1, g=1, bias=True, w=None):
+        """Initializes a TensorFlow 2D convolution layer, mimicking PyTorch's nn.Conv2D functionality for given filter
+        sizes and stride.
+        """
+        super().__init__()
+        assert g == 1, "TF v2.2 Conv2D does not support 'groups' argument"
+        self.conv = keras.layers.Conv2D(
+            filters=c2,
+            kernel_size=k,
+            strides=s,
+            padding="VALID",
+            use_bias=bias,
+            kernel_initializer=keras.initializers.Constant(w.weight.permute(2, 3, 1, 0).numpy()),
+            bias_initializer=keras.initializers.Constant(w.bias.numpy()) if bias else None,
         )
 
-
-def generate_individual(input_ranges, individual_length):
-    """Generates a list of random values within specified input ranges for each gene in the individual."""
-    individual = []
-    for i in range(individual_length):
-        lower_bound, upper_bound = input_ranges[i]
-        individual.append(random.uniform(lower_bound, upper_bound))
-    return individual
+    def call(self, inputs):
+        """Applies a convolution operation to the inputs and returns the result."""
+        return self.conv(inputs)
 
 
-def run(**kwargs):
+class TFBottleneckCSP(keras.layers.Layer):
+    # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, w=None):
+        """
+        Initializes CSP bottleneck layer with specified channel sizes, count, shortcut option, groups, and expansion
+        ratio.
+
+        Inputs are ch_in, ch_out, number, shortcut, groups, expansion.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = TFConv(c1, c_, 1, 1, w=w.cv1)
+        self.cv2 = TFConv2d(c1, c_, 1, 1, bias=False, w=w.cv2)
+        self.cv3 = TFConv2d(c_, c_, 1, 1, bias=False, w=w.cv3)
+        self.cv4 = TFConv(2 * c_, c2, 1, 1, w=w.cv4)
+        self.bn = TFBN(w.bn)
+        self.act = lambda x: keras.activations.swish(x)
+        self.m = keras.Sequential([TFBottleneck(c_, c_, shortcut, g, e=1.0, w=w.m[j]) for j in range(n)])
+
+    def call(self, inputs):
+        """Processes input through the model layers, concatenates, normalizes, activates, and reduces the output
+        dimensions.
+        """
+        y1 = self.cv3(self.m(self.cv1(inputs)))
+        y2 = self.cv2(inputs)
+        return self.cv4(self.act(self.bn(tf.concat((y1, y2), axis=3))))
+
+
+class TFC3(keras.layers.Layer):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, w=None):
+        """
+        Initializes CSP Bottleneck with 3 convolutions, supporting optional shortcuts and group convolutions.
+
+        Inputs are ch_in, ch_out, number, shortcut, groups, expansion.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = TFConv(c1, c_, 1, 1, w=w.cv1)
+        self.cv2 = TFConv(c1, c_, 1, 1, w=w.cv2)
+        self.cv3 = TFConv(2 * c_, c2, 1, 1, w=w.cv3)
+        self.m = keras.Sequential([TFBottleneck(c_, c_, shortcut, g, e=1.0, w=w.m[j]) for j in range(n)])
+
+    def call(self, inputs):
+        """
+        Processes input through a sequence of transformations for object detection (YOLOv5).
+
+        See https://github.com/ultralytics/yolov5.
+        """
+        return self.cv3(tf.concat((self.m(self.cv1(inputs)), self.cv2(inputs)), axis=3))
+
+
+class TFC3x(keras.layers.Layer):
+    # 3 module with cross-convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, w=None):
+        """
+        Initializes layer with cross-convolutions for enhanced feature extraction in object detection models.
+
+        Inputs are ch_in, ch_out, number, shortcut, groups, expansion.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = TFConv(c1, c_, 1, 1, w=w.cv1)
+        self.cv2 = TFConv(c1, c_, 1, 1, w=w.cv2)
+        self.cv3 = TFConv(2 * c_, c2, 1, 1, w=w.cv3)
+        self.m = keras.Sequential(
+            [TFCrossConv(c_, c_, k=3, s=1, g=g, e=1.0, shortcut=shortcut, w=w.m[j]) for j in range(n)]
+        )
+
+    def call(self, inputs):
+        """Processes input through cascaded convolutions and merges features, returning the final tensor output."""
+        return self.cv3(tf.concat((self.m(self.cv1(inputs)), self.cv2(inputs)), axis=3))
+
+
+class TFSPP(keras.layers.Layer):
+    # Spatial pyramid pooling layer used in YOLOv3-SPP
+    def __init__(self, c1, c2, k=(5, 9, 13), w=None):
+        """Initializes a YOLOv3-SPP layer with specific input/output channels and kernel sizes for pooling."""
+        super().__init__()
+        c_ = c1 // 2  # hidden channels
+        self.cv1 = TFConv(c1, c_, 1, 1, w=w.cv1)
+        self.cv2 = TFConv(c_ * (len(k) + 1), c2, 1, 1, w=w.cv2)
+        self.m = [keras.layers.MaxPool2D(pool_size=x, strides=1, padding="SAME") for x in k]
+
+    def call(self, inputs):
+        """Processes input through two TFConv layers and concatenates with max-pooled outputs at intermediate stage."""
+        x = self.cv1(inputs)
+        return self.cv2(tf.concat([x] + [m(x) for m in self.m], 3))
+
+
+class TFSPPF(keras.layers.Layer):
+    # Spatial pyramid pooling-Fast layer
+    def __init__(self, c1, c2, k=5, w=None):
+        """Initializes a fast spatial pyramid pooling layer with customizable in/out channels, kernel size, and
+        weights.
+        """
+        super().__init__()
+        c_ = c1 // 2  # hidden channels
+        self.cv1 = TFConv(c1, c_, 1, 1, w=w.cv1)
+        self.cv2 = TFConv(c_ * 4, c2, 1, 1, w=w.cv2)
+        self.m = keras.layers.MaxPool2D(pool_size=k, strides=1, padding="SAME")
+
+    def call(self, inputs):
+        """Executes the model's forward pass, concatenating input features with three max-pooled versions before final
+        convolution.
+        """
+        x = self.cv1(inputs)
+        y1 = self.m(x)
+        y2 = self.m(y1)
+        return self.cv2(tf.concat([x, y1, y2, self.m(y2)], 3))
+
+
+class TFDetect(keras.layers.Layer):
+    # TF YOLOv5 Detect layer
+    def __init__(self, nc=80, anchors=(), ch=(), imgsz=(640, 640), w=None):
+        """Initializes YOLOv5 detection layer for TensorFlow with configurable classes, anchors, channels, and image
+        size.
+        """
+        super().__init__()
+        self.stride = tf.convert_to_tensor(w.stride.numpy(), dtype=tf.float32)
+        self.nc = nc  # number of classes
+        self.no = nc + 5  # number of outputs per anchor
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.grid = [tf.zeros(1)] * self.nl  # init grid
+        self.anchors = tf.convert_to_tensor(w.anchors.numpy(), dtype=tf.float32)
+        self.anchor_grid = tf.reshape(self.anchors * tf.reshape(self.stride, [self.nl, 1, 1]), [self.nl, 1, -1, 1, 2])
+        self.m = [TFConv2d(x, self.no * self.na, 1, w=w.m[i]) for i, x in enumerate(ch)]
+        self.training = False  # set to False after building model
+        self.imgsz = imgsz
+        for i in range(self.nl):
+            ny, nx = self.imgsz[0] // self.stride[i], self.imgsz[1] // self.stride[i]
+            self.grid[i] = self._make_grid(nx, ny)
+
+    def call(self, inputs):
+        """Performs forward pass through the model layers to predict object bounding boxes and classifications."""
+        z = []  # inference output
+        x = []
+        for i in range(self.nl):
+            x.append(self.m[i](inputs[i]))
+            # x(bs,20,20,255) to x(bs,3,20,20,85)
+            ny, nx = self.imgsz[0] // self.stride[i], self.imgsz[1] // self.stride[i]
+            x[i] = tf.reshape(x[i], [-1, ny * nx, self.na, self.no])
+
+            if not self.training:  # inference
+                y = x[i]
+                grid = tf.transpose(self.grid[i], [0, 2, 1, 3]) - 0.5
+                anchor_grid = tf.transpose(self.anchor_grid[i], [0, 2, 1, 3]) * 4
+                xy = (tf.sigmoid(y[..., 0:2]) * 2 + grid) * self.stride[i]  # xy
+                wh = tf.sigmoid(y[..., 2:4]) ** 2 * anchor_grid
+                # Normalize xywh to 0-1 to reduce calibration error
+                xy /= tf.constant([[self.imgsz[1], self.imgsz[0]]], dtype=tf.float32)
+                wh /= tf.constant([[self.imgsz[1], self.imgsz[0]]], dtype=tf.float32)
+                y = tf.concat([xy, wh, tf.sigmoid(y[..., 4 : 5 + self.nc]), y[..., 5 + self.nc :]], -1)
+                z.append(tf.reshape(y, [-1, self.na * ny * nx, self.no]))
+
+        return tf.transpose(x, [0, 2, 1, 3]) if self.training else (tf.concat(z, 1),)
+
+    @staticmethod
+    def _make_grid(nx=20, ny=20):
+        """Generates a 2D grid of coordinates in (x, y) format with shape [1, 1, ny*nx, 2]."""
+        # return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+        xv, yv = tf.meshgrid(tf.range(nx), tf.range(ny))
+        return tf.cast(tf.reshape(tf.stack([xv, yv], 2), [1, 1, ny * nx, 2]), dtype=tf.float32)
+
+
+class TFSegment(TFDetect):
+    # YOLOv5 Segment head for segmentation models
+    def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), imgsz=(640, 640), w=None):
+        """Initializes YOLOv5 Segment head with specified channel depths, anchors, and input size for segmentation
+        models.
+        """
+        super().__init__(nc, anchors, ch, imgsz, w)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.no = 5 + nc + self.nm  # number of outputs per anchor
+        self.m = [TFConv2d(x, self.no * self.na, 1, w=w.m[i]) for i, x in enumerate(ch)]  # output conv
+        self.proto = TFProto(ch[0], self.npr, self.nm, w=w.proto)  # protos
+        self.detect = TFDetect.call
+
+    def call(self, x):
+        """Applies detection and proto layers on input, returning detections and optionally protos if training."""
+        p = self.proto(x[0])
+        # p = TFUpsample(None, scale_factor=4, mode='nearest')(self.proto(x[0]))  # (optional) full-size protos
+        p = tf.transpose(p, [0, 3, 1, 2])  # from shape(1,160,160,32) to shape(1,32,160,160)
+        x = self.detect(self, x)
+        return (x, p) if self.training else (x[0], p)
+
+
+class TFProto(keras.layers.Layer):
+    def __init__(self, c1, c_=256, c2=32, w=None):
+        """Initializes TFProto layer with convolutional and upsampling layers for feature extraction and
+        transformation.
+        """
+        super().__init__()
+        self.cv1 = TFConv(c1, c_, k=3, w=w.cv1)
+        self.upsample = TFUpsample(None, scale_factor=2, mode="nearest")
+        self.cv2 = TFConv(c_, c_, k=3, w=w.cv2)
+        self.cv3 = TFConv(c_, c2, w=w.cv3)
+
+    def call(self, inputs):
+        """Performs forward pass through the model, applying convolutions and upscaling on input tensor."""
+        return self.cv3(self.cv2(self.upsample(self.cv1(inputs))))
+
+
+class TFUpsample(keras.layers.Layer):
+    # TF version of torch.nn.Upsample()
+    def __init__(self, size, scale_factor, mode, w=None):
+        """
+        Initializes a TensorFlow upsampling layer with specified size, scale_factor, and mode, ensuring scale_factor is
+        even.
+
+        Warning: all arguments needed including 'w'
+        """
+        super().__init__()
+        assert scale_factor % 2 == 0, "scale_factor must be multiple of 2"
+        self.upsample = lambda x: tf.image.resize(x, (x.shape[1] * scale_factor, x.shape[2] * scale_factor), mode)
+        # self.upsample = keras.layers.UpSampling2D(size=scale_factor, interpolation=mode)
+        # with default arguments: align_corners=False, half_pixel_centers=False
+        # self.upsample = lambda x: tf.raw_ops.ResizeNearestNeighbor(images=x,
+        #                                                            size=(x.shape[1] * 2, x.shape[2] * 2))
+
+    def call(self, inputs):
+        """Applies upsample operation to inputs using nearest neighbor interpolation."""
+        return self.upsample(inputs)
+
+
+class TFConcat(keras.layers.Layer):
+    # TF version of torch.concat()
+    def __init__(self, dimension=1, w=None):
+        """Initializes a TensorFlow layer for NCHW to NHWC concatenation, requiring dimension=1."""
+        super().__init__()
+        assert dimension == 1, "convert only NCHW to NHWC concat"
+        self.d = 3
+
+    def call(self, inputs):
+        """Concatenates a list of tensors along the last dimension, used for NCHW to NHWC conversion."""
+        return tf.concat(inputs, self.d)
+
+
+def parse_model(d, ch, model, imgsz):
+    """Parses a model definition dict `d` to create YOLOv5 model layers, including dynamic channel adjustments."""
+    LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
+    anchors, nc, gd, gw, ch_mul = (
+        d["anchors"],
+        d["nc"],
+        d["depth_multiple"],
+        d["width_multiple"],
+        d.get("channel_multiple"),
+    )
+    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
+    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    if not ch_mul:
+        ch_mul = 8
+
+    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+        m_str = m
+        m = eval(m) if isinstance(m, str) else m  # eval strings
+        for j, a in enumerate(args):
+            try:
+                args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+            except NameError:
+                pass
+
+        n = max(round(n * gd), 1) if n > 1 else n  # depth gain
+        if m in [
+            nn.Conv2d,
+            Conv,
+            DWConv,
+            DWConvTranspose2d,
+            Bottleneck,
+            SPP,
+            SPPF,
+            MixConv2d,
+            Focus,
+            CrossConv,
+            BottleneckCSP,
+            C3,
+            C3x,
+        ]:
+            c1, c2 = ch[f], args[0]
+            c2 = make_divisible(c2 * gw, ch_mul) if c2 != no else c2
+
+            args = [c1, c2, *args[1:]]
+            if m in [BottleneckCSP, C3, C3x]:
+                args.insert(2, n)
+                n = 1
+        elif m is nn.BatchNorm2d:
+            args = [ch[f]]
+        elif m is Concat:
+            c2 = sum(ch[-1 if x == -1 else x + 1] for x in f)
+        elif m in [Detect, Segment]:
+            args.append([ch[x + 1] for x in f])
+            if isinstance(args[1], int):  # number of anchors
+                args[1] = [list(range(args[1] * 2))] * len(f)
+            if m is Segment:
+                args[3] = make_divisible(args[3] * gw, ch_mul)
+            args.append(imgsz)
+        else:
+            c2 = ch[f]
+
+        tf_m = eval("TF" + m_str.replace("nn.", ""))
+        m_ = (
+            keras.Sequential([tf_m(*args, w=model.model[i][j]) for j in range(n)])
+            if n > 1
+            else tf_m(*args, w=model.model[i])
+        )  # module
+
+        torch_m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        t = str(m)[8:-2].replace("__main__.", "")  # module type
+        np = sum(x.numel() for x in torch_m_.parameters())  # number params
+        m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
+        LOGGER.info(f"{i:>3}{str(f):>18}{str(n):>3}{np:>10}  {t:<40}{str(args):<30}")  # print
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        layers.append(m_)
+        ch.append(c2)
+    return keras.Sequential(layers), sorted(save)
+
+
+class TFModel:
+    # TF YOLOv5 model
+    def __init__(self, cfg="yolov5s.yaml", ch=3, nc=None, model=None, imgsz=(640, 640)):
+        """Initializes TF YOLOv5 model with specified configuration, channels, classes, model instance, and input
+        size.
+        """
+        super().__init__()
+        if isinstance(cfg, dict):
+            self.yaml = cfg  # model dict
+        else:  # is *.yaml
+            import yaml  # for torch hub
+
+            self.yaml_file = Path(cfg).name
+            with open(cfg) as f:
+                self.yaml = yaml.load(f, Loader=yaml.FullLoader)  # model dict
+
+        # Define model
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding {cfg} nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc  # override yaml value
+        self.model, self.savelist = parse_model(deepcopy(self.yaml), ch=[ch], model=model, imgsz=imgsz)
+
+    def predict(
+        self,
+        inputs,
+        tf_nms=False,
+        agnostic_nms=False,
+        topk_per_class=100,
+        topk_all=100,
+        iou_thres=0.45,
+        conf_thres=0.25,
+    ):
+        y = []  # outputs
+        x = inputs
+        for m in self.model.layers:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+
+            x = m(x)  # run
+            y.append(x if m.i in self.savelist else None)  # save output
+
+        # Add TensorFlow NMS
+        if tf_nms:
+            boxes = self._xywh2xyxy(x[0][..., :4])
+            probs = x[0][:, :, 4:5]
+            classes = x[0][:, :, 5:]
+            scores = probs * classes
+            if agnostic_nms:
+                nms = AgnosticNMS()((boxes, classes, scores), topk_all, iou_thres, conf_thres)
+            else:
+                boxes = tf.expand_dims(boxes, 2)
+                nms = tf.image.combined_non_max_suppression(
+                    boxes, scores, topk_per_class, topk_all, iou_thres, conf_thres, clip_boxes=False
+                )
+            return (nms,)
+        return x  # output [1,6300,85] = [xywh, conf, class0, class1, ...]
+        # x = x[0]  # [x(1,6300,85), ...] to x(6300,85)
+        # xywh = x[..., :4]  # x(6300,4) boxes
+        # conf = x[..., 4:5]  # x(6300,1) confidences
+        # cls = tf.reshape(tf.cast(tf.argmax(x[..., 5:], axis=1), tf.float32), (-1, 1))  # x(6300,1)  classes
+        # return tf.concat([conf, cls, xywh], 1)
+
+    @staticmethod
+    def _xywh2xyxy(xywh):
+        """Converts bounding box format from [x, y, w, h] to [x1, y1, x2, y2], where xy1=top-left and xy2=bottom-
+        right.
+        """
+        x, y, w, h = tf.split(xywh, num_or_size_splits=4, axis=-1)
+        return tf.concat([x - w / 2, y - h / 2, x + w / 2, y + h / 2], axis=-1)
+
+
+class AgnosticNMS(keras.layers.Layer):
+    # TF Agnostic NMS
+    def call(self, input, topk_all, iou_thres, conf_thres):
+        """Performs agnostic NMS on input tensors using given thresholds and top-K selection."""
+        return tf.map_fn(
+            lambda x: self._nms(x, topk_all, iou_thres, conf_thres),
+            input,
+            fn_output_signature=(tf.float32, tf.float32, tf.float32, tf.int32),
+            name="agnostic_nms",
+        )
+
+    @staticmethod
+    def _nms(x, topk_all=100, iou_thres=0.45, conf_thres=0.25):
+        """Performs agnostic non-maximum suppression (NMS) on detected objects, filtering based on IoU and confidence
+        thresholds.
+        """
+        boxes, classes, scores = x
+        class_inds = tf.cast(tf.argmax(classes, axis=-1), tf.float32)
+        scores_inp = tf.reduce_max(scores, -1)
+        selected_inds = tf.image.non_max_suppression(
+            boxes, scores_inp, max_output_size=topk_all, iou_threshold=iou_thres, score_threshold=conf_thres
+        )
+        selected_boxes = tf.gather(boxes, selected_inds)
+        padded_boxes = tf.pad(
+            selected_boxes,
+            paddings=[[0, topk_all - tf.shape(selected_boxes)[0]], [0, 0]],
+            mode="CONSTANT",
+            constant_values=0.0,
+        )
+        selected_scores = tf.gather(scores_inp, selected_inds)
+        padded_scores = tf.pad(
+            selected_scores,
+            paddings=[[0, topk_all - tf.shape(selected_boxes)[0]]],
+            mode="CONSTANT",
+            constant_values=-1.0,
+        )
+        selected_classes = tf.gather(class_inds, selected_inds)
+        padded_classes = tf.pad(
+            selected_classes,
+            paddings=[[0, topk_all - tf.shape(selected_boxes)[0]]],
+            mode="CONSTANT",
+            constant_values=-1.0,
+        )
+        valid_detections = tf.shape(selected_inds)[0]
+        return padded_boxes, padded_scores, padded_classes, valid_detections
+
+
+def activations(act=nn.SiLU):
+    """Converts PyTorch activations to TensorFlow equivalents, supporting LeakyReLU, Hardswish, and SiLU/Swish."""
+    if isinstance(act, nn.LeakyReLU):
+        return lambda x: keras.activations.relu(x, alpha=0.1)
+    elif isinstance(act, nn.Hardswish):
+        return lambda x: x * tf.nn.relu6(x + 3) * 0.166666667
+    elif isinstance(act, (nn.SiLU, SiLU)):
+        return lambda x: keras.activations.swish(x)
+    else:
+        raise Exception(f"no matching TensorFlow activation found for PyTorch activation {act}")
+
+
+def representative_dataset_gen(dataset, ncalib=100):
+    """Generates a representative dataset for calibration by yielding transformed numpy arrays from the input
+    dataset.
     """
-    Executes YOLOv5 training with given options, overriding with any kwargs provided.
+    for n, (path, img, im0s, vid_cap, string) in enumerate(dataset):
+        im = np.transpose(img, [1, 2, 0])
+        im = np.expand_dims(im, axis=0).astype(np.float32)
+        im /= 255
+        yield [im]
+        if n >= ncalib:
+            break
 
-    Example: import train; train.run(data='coco128.yaml', imgsz=320, weights='yolov5m.pt')
+
+def run(
+    weights=ROOT / "yolov5s.pt",  # weights path
+    imgsz=(640, 640),  # inference size h,w
+    batch_size=1,  # batch size
+    dynamic=False,  # dynamic batch size
+):
+    # PyTorch model
+    im = torch.zeros((batch_size, 3, *imgsz))  # BCHW image
+    model = attempt_load(weights, device=torch.device("cpu"), inplace=True, fuse=False)
+    _ = model(im)  # inference
+    model.info()
+
+    # TensorFlow model
+    im = tf.zeros((batch_size, *imgsz, 3))  # BHWC image
+    tf_model = TFModel(cfg=model.yaml, model=model, nc=model.nc, imgsz=imgsz)
+    _ = tf_model.predict(im)  # inference
+
+    # Keras model
+    im = keras.Input(shape=(*imgsz, 3), batch_size=None if dynamic else batch_size)
+    keras_model = keras.Model(inputs=im, outputs=tf_model.predict(im))
+    keras_model.summary()
+
+    LOGGER.info("PyTorch, TensorFlow and Keras models successfully verified.\nUse export.py for TF model export.")
+
+
+def parse_opt():
+    """Parses and returns command-line options for model inference, including weights path, image size, batch size, and
+    dynamic batching.
     """
-    opt = parse_opt(True)
-    for k, v in kwargs.items():
-        setattr(opt, k, v)
-    main(opt)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="weights path")
+    parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
+    parser.add_argument("--batch-size", type=int, default=1, help="batch size")
+    parser.add_argument("--dynamic", action="store_true", help="dynamic batch size")
+    opt = parser.parse_args()
+    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
+    print_args(vars(opt))
     return opt
+
+
+def main(opt):
+    """Executes the YOLOv5 model run function with parsed command line options."""
+    run(**vars(opt))
 
 
 if __name__ == "__main__":
